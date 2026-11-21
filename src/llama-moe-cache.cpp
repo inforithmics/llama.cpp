@@ -401,13 +401,13 @@ struct llama_moe_cache::impl {
 
     // splits the groups whose biggest bank does not fit in one allocation of the device into groups of
     // contiguous layers with proportionally split slots, each with its own SLRU
-    static void split_groups(std::vector<group> & groups, const std::vector<device> & devices, int32_t n_expert_used) {
+    static void split_groups(std::vector<group> & groups, const std::vector<device> & devices, const std::vector<size_t> & max_bank, int32_t n_expert_used) {
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             group & g = groups[ig];
             if (g.n_slots == 0) {
                 continue;
             }
-            const size_t max_bank_bytes = ggml_backend_buft_get_max_size(devices[g.id].buft);
+            const size_t max_bank_bytes = max_bank[g.id];
             if (max_bank_bytes == SIZE_MAX) {
                 continue;
             }
@@ -555,8 +555,6 @@ struct llama_moe_cache::impl {
             }
             write_trace_header(split_sum);
         }
-        std::vector<size_t> n_tensors(devices.size(), 0);
-        size_t n_tensors_host = 0;
         for (group & g : groups) {
             const device & d = devices[g.id];
             const int32_t n_expert  = g.ref[0]->ne[2];
@@ -572,20 +570,11 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // banks bigger than a single allocation of the device can not be allocated (4 GiB on RADV)
-        split_groups(groups, devices, n_expert_used);
-
-        for (group & g : groups) {
-            if (g.n_slots == 0) {
-                continue;
-            }
-            g.lru.init(model.layers.size(), g.ref[0]->ne[2], g.n_slots);
-            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
-            n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot maps and CPU map
-        }
-        if (n_tensors_host == 0) {
-            throw std::runtime_error("MoE cache is too small to hold the experts of one token");
-        }
+        // if a device fails to allocate its banks (e.g. above 4 GiB on RADV), its banks are halved and the allocation is retried
+        const std::vector<group> groups_full = groups;
+        std::vector<size_t> max_bank(devices.size(), SIZE_MAX);
+        ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
+        const size_t alignment_host = ggml_backend_buft_get_alignment(buft_host);
 
         auto init_ctx = [](size_t n_tensors) {
             ggml_init_params params = {
@@ -599,67 +588,117 @@ struct llama_moe_cache::impl {
             }
             return res;
         };
-        for (size_t id = 0; id < devices.size(); ++id) {
-            if (n_tensors[id] > 0) {
-                devices[id].ctx = init_ctx(n_tensors[id]);
-            }
-        }
-        ctx_host  = init_ctx(n_tensors_host);
-        ctx_views = init_ctx(2);
 
-        ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
-        const size_t alignment_host = ggml_backend_buft_get_alignment(buft_host);
+        for (bool done = false; !done;) {
+            groups = groups_full;
+            layers.assign(model.layers.size(), layer());
+            bindings.clear();
+            layer_of.clear();
+            buf_host_size = 0;
+            for (device & d : devices) {
+                d.buf.reset();
+                d.ctx.reset();
+                d.buf_size = 0;
+            }
+            split_groups(groups, devices, max_bank, n_expert_used);
 
-        for (size_t ig = 0; ig < groups.size(); ++ig) {
-            group & g = groups[ig];
-            if (g.n_slots == 0) {
-                continue;
-            }
-            ggml_context * ctx = devices[g.id].ctx.get();
-            for (const ggml_tensor * t : g.ref) {
-                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + n_zero + 1);
-                GGML_ASSERT(bank->nb[2] == t->nb[2]);
-                ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
-                g.banks.push_back(bank);
-            }
-            for (int32_t il : g.layers) {
-                layer & l = layers[il];
-                l.ig      = (int32_t) ig;
-                l.experts = llama_moe_cache_layer_experts(model.layers[il]);
-                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-                    ggml_tensor * bank   = g.banks[ip];
-                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero, bank->nb[1], bank->nb[2], 0);
-                    ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
-                    bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
+            std::vector<size_t> n_tensors(devices.size(), 0);
+            size_t n_tensors_host = 0;
+            for (group & g : groups) {
+                if (g.n_slots == 0) {
+                    continue;
                 }
-                l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
-                ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
-                layer_of[l.slot_map] = { il, false };
-                buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
-                if (n_zero > 0) {
-                    l.slot_map_cpu = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
-                    ggml_format_name(l.slot_map_cpu, "moe_cache.slot_map_cpu-%d", il);
-                    layer_of[l.slot_map_cpu] = { il, true };
-                    buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map_cpu), alignment_host);
-                    l.cpu_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
-                    ggml_format_name(l.cpu_map, "moe_cache.cpu_map-%d", il);
-                    buf_host_size += GGML_PAD(ggml_nbytes(l.cpu_map), alignment_host);
+                g.lru.init(model.layers.size(), g.ref[0]->ne[2], g.n_slots);
+                n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+                n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot maps and CPU map
+            }
+            if (n_tensors_host == 0) {
+                throw std::runtime_error("MoE cache is too small to hold the experts of one token");
+            }
+
+            for (size_t id = 0; id < devices.size(); ++id) {
+                if (n_tensors[id] > 0) {
+                    devices[id].ctx = init_ctx(n_tensors[id]);
                 }
             }
-            devices[g.id].buf_size += alloc_size(g, g.n_slots);
+            ctx_host  = init_ctx(n_tensors_host);
+            ctx_views = init_ctx(2);
+
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                group & g = groups[ig];
+                if (g.n_slots == 0) {
+                    continue;
+                }
+                ggml_context * ctx = devices[g.id].ctx.get();
+                for (const ggml_tensor * t : g.ref) {
+                    ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + n_zero + 1);
+                    GGML_ASSERT(bank->nb[2] == t->nb[2]);
+                    ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
+                    g.banks.push_back(bank);
+                }
+                for (int32_t il : g.layers) {
+                    layer & l = layers[il];
+                    l.ig      = (int32_t) ig;
+                    l.experts = llama_moe_cache_layer_experts(model.layers[il]);
+                    for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                        ggml_tensor * bank   = g.banks[ip];
+                        ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero, bank->nb[1], bank->nb[2], 0);
+                        ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
+                        bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
+                    }
+                    l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                    ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
+                    layer_of[l.slot_map] = { il, false };
+                    buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
+                    if (n_zero > 0) {
+                        l.slot_map_cpu = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                        ggml_format_name(l.slot_map_cpu, "moe_cache.slot_map_cpu-%d", il);
+                        layer_of[l.slot_map_cpu] = { il, true };
+                        buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map_cpu), alignment_host);
+                        l.cpu_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                        ggml_format_name(l.cpu_map, "moe_cache.cpu_map-%d", il);
+                        buf_host_size += GGML_PAD(ggml_nbytes(l.cpu_map), alignment_host);
+                    }
+                }
+                devices[g.id].buf_size += alloc_size(g, g.n_slots);
+            }
+
+            done = true;
+            for (size_t id = 0; id < devices.size(); ++id) {
+                device & d = devices[id];
+                if (!d.ctx) {
+                    continue;
+                }
+                // with no_alloc, dummy buffers are attached so the memory use can still be measured, see llama_context::memory_breakdown
+                try {
+                    d.buf = llama_memory_bufs::alloc_buf(d.ctx.get(), d.buft, no_alloc, "MoE cache");
+                } catch (const std::runtime_error &) {
+                    size_t bank_max = 0;
+                    for (const group & g : groups) {
+                        if (g.id != (int32_t) id) {
+                            continue;
+                        }
+                        for (const ggml_tensor * bank : g.banks) {
+                            bank_max = std::max(bank_max, ggml_backend_buft_get_alloc_size(d.buft, bank));
+                        }
+                    }
+                    // below max_size/2 the banks are small enough, the failure is not caused by their size
+                    if (bank_max/2 < ggml_backend_buft_get_max_size(d.buft)/2) {
+                        throw;
+                    }
+                    max_bank[id] = bank_max/2;
+                    LLAMA_LOG_WARN("%s: %s: failed to allocate the MoE cache, retrying with banks below %.2f MiB\n", __func__,
+                        ggml_backend_buft_name(d.buft), max_bank[id]/1024.0/1024.0);
+                    done = false;
+                    break;
+                }
+                if (!no_alloc) {
+                    ggml_backend_buffer_clear(d.buf.get(), 0);
+                    d.buf_size = ggml_backend_buffer_get_size(d.buf.get());
+                }
+            }
         }
 
-        // with no_alloc, dummy buffers are attached so the memory use can still be measured, see llama_context::memory_breakdown
-        for (device & d : devices) {
-            if (!d.ctx) {
-                continue;
-            }
-            d.buf = llama_memory_bufs::alloc_buf(d.ctx.get(), d.buft, no_alloc, "MoE cache");
-            if (!no_alloc) {
-                ggml_backend_buffer_clear(d.buf.get(), 0);
-                d.buf_size = ggml_backend_buffer_get_size(d.buf.get());
-            }
-        }
         buf_host = llama_memory_bufs::alloc_buf(ctx_host.get(), buft_host, no_alloc, "MoE cache slot maps");
         if (!no_alloc) {
             ggml_backend_buffer_clear(buf_host.get(), 0xff); // the CPU maps are -1
